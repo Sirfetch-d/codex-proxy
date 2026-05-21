@@ -1,12 +1,20 @@
 # codex-proxy
 
-macOS 版 [Codex](https://github.com/openai/codex) 通过 Clash 代理联网的启动脚本。解决不开启 TUN 模式时，HTTP 流量走代理但 WebSocket 不走代理，导致移动端 ChatGPT 无法远程连接电脑 Codex App 的问题。不影响其他 App 的代理设置。
+macOS 版 [Codex](https://github.com/openai/codex) 通过 Clash 代理联网的启动脚本。解决不开启 TUN 模式时，HTTP 流量走代理但 WebSocket 不走代理导致的两个问题。仅影响 Codex 进程本身，不影响其他 GUI App 的代理设置。
 
 ## 背景
 
-macOS 下 Codex App + Clash 环境，如果不开启 TUN 模式，仅 HTTP 流量会走系统代理，WebSocket 连接不会经过代理。Codex App 远程连接功能依赖 WebSocket，因此会出现移动端无法连接远程电脑的情况，Codex App 界面显示 `reconnecting 1/5` 到 `5/5` 后连接失败。
+macOS 下 Codex App + Clash 环境，如果不开启 TUN 模式，仅 HTTP 流量会走系统代理，WebSocket 连接不会经过代理。这会引发两个独立的问题：
 
-开启 TUN 模式虽然可以解决，但会影响整机所有网络流量。此脚本通过环境变量注入 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，使 Codex 进程的 HTTP 和 WebSocket 流量全部经过 Clash 代理，无需开启 TUN 模式。
+**问题 A：移动端 ChatGPT 无法远程连接电脑 Codex App**
+
+Codex 的[远程连接功能](https://developers.openai.com/codex/remote-connections)依赖 WebSocket 长连接，手机端 ChatGPT App 通过 WebSocket 与电脑端 Codex 通信。WebSocket 不走代理时，手机端无法发现或连接到电脑。
+
+**问题 B：Codex App 自身反复重连（Reconnecting 1/5 ∼ 5/5）**
+
+Codex App 与 OpenAI 后端之间同样依赖 WebSocket 维持长连接。WebSocket 不走代理时，App 连接后端失败，界面显示 `reconnecting 1/5` 到 `5/5`，重试 5 次后放弃。
+
+开启 TUN 模式可以同时解决这两个问题，但 TUN 是虚拟网卡级别的全局代理，会影响整机所有 App 的网络流量。此脚本通过环境变量注入 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，只让 Codex 这一个进程的 HTTP 和 WebSocket 流量走 Clash 代理，其他 GUI App 不受任何影响。
 
 ## 前置条件
 
