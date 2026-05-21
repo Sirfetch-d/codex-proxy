@@ -1,10 +1,12 @@
 # codex-proxy
 
-让 macOS 版 [Codex](https://github.com/openai/codex) 通过 Clash 代理联网的启动脚本。解决在不开启 TUN 模式的情况下，Codex App 无法走代理访问 API 的问题，同时不影响其他 App 的代理设置。
+macOS 版 [Codex](https://github.com/openai/codex) 通过 Clash 代理联网的启动脚本。解决不开启 TUN 模式时，HTTP 流量走代理但 WebSocket 不走代理，导致移动端 ChatGPT 无法远程连接电脑 Codex App 的问题。不影响其他 App 的代理设置。
 
 ## 背景
 
-macOS 下用 Codex App + Clash 环境时，如果不开 TUN 模式，Codex 无法通过代理连接后端服务。开启 TUN 模式会影响整机网络流量。这个脚本通过环境变量注入代理配置，只让 Codex 进程走代理。
+macOS 下 Codex App + Clash 环境，如果不开启 TUN 模式，仅 HTTP 流量会走系统代理，WebSocket 连接不会经过代理。Codex App 远程连接功能依赖 WebSocket，因此会出现移动端无法连接远程电脑的情况，Codex App 界面显示 `reconnecting 1/5` 到 `5/5` 后连接失败。
+
+开启 TUN 模式虽然可以解决，但会影响整机所有网络流量。此脚本通过环境变量注入 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，使 Codex 进程的 HTTP 和 WebSocket 流量全部经过 Clash 代理，无需开启 TUN 模式。
 
 ## 前置条件
 
