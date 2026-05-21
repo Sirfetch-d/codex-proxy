@@ -12,7 +12,7 @@ Codex 的[远程连接功能](https://developers.openai.com/codex/remote-connect
 
 **问题 B：Codex App 自身反复重连（Reconnecting 1/5 ∼ 5/5）**
 
-Codex App 与 OpenAI 后端之间同样依赖 WebSocket 维持长连接。WebSocket 不走代理时，App 连接后端失败，界面显示 `reconnecting 1/5` 到 `5/5`，重试 5 次后放弃。
+Codex App 与 OpenAI 后端之间优先使用 WebSocket（延迟更低）。WebSocket 不走代理时，握手失败，界面显示 `reconnecting 1/5` 到 `5/5`，每次重试约 15 秒，5 次失败后才 fallback 到 HTTP 连接。这不仅拖慢了首次响应时间（累计等待可达 75 秒以上），HTTP 模式下长连接稳定性也不如 WebSocket。
 
 开启 TUN 模式可以同时解决这两个问题，但 TUN 是虚拟网卡级别的全局代理，会影响整机所有 App 的网络流量。此脚本通过环境变量注入 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，只让 Codex 这一个进程的 HTTP 和 WebSocket 流量走 Clash 代理，其他 GUI App 不受任何影响。
 
