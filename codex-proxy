@@ -2,7 +2,7 @@
 
 set -u
 
-APP_BUNDLE="${CODEX_APP:-/Applications/Codex.app}"
+APP_BUNDLE="${CHATGPT_APP:-${CODEX_APP:-/Applications/ChatGPT.app}}"
 HTTP_PROXY_ADDR="${CODEX_HTTP_PROXY:-http://127.0.0.1:7890}"
 ALL_PROXY_ADDR="${CODEX_ALL_PROXY:-socks5://127.0.0.1:7890}"
 NO_PROXY_LIST="${CODEX_NO_PROXY:-localhost,127.0.0.1,::1}"
@@ -32,8 +32,8 @@ get_executable() {
     return
   fi
 
-  if [ -x "$APP_BUNDLE/Contents/MacOS/Codex" ]; then
-    echo "$APP_BUNDLE/Contents/MacOS/Codex"
+  if [ -x "$APP_BUNDLE/Contents/MacOS/ChatGPT" ]; then
+    echo "$APP_BUNDLE/Contents/MacOS/ChatGPT"
     return
   fi
 
@@ -45,7 +45,7 @@ get_executable() {
     fi
   done
 
-  echo "错误：找不到 Codex 可执行文件"
+  echo "错误：找不到 ChatGPT 可执行文件"
   exit 1
 }
 
@@ -56,7 +56,7 @@ is_running() {
 }
 
 start_codex() {
-  echo "准备启动 Codex with proxy..."
+  echo "准备启动 ChatGPT with proxy..."
   echo "App: $APP_BUNDLE"
   echo "Executable: $EXE"
   echo "HTTP_PROXY: $HTTP_PROXY_ADDR"
@@ -64,7 +64,7 @@ start_codex() {
   echo "Log: $LOG_FILE"
 
   # 先退出普通方式启动的 Codex，避免残留一个不带代理的进程
-  osascript -e 'quit app "Codex"' >/dev/null 2>&1 || true
+  osascript -e 'quit app "ChatGPT"' >/dev/null 2>&1 || true
   sleep 1
 
   # 如果还没退出，强制结束
@@ -89,19 +89,19 @@ start_codex() {
   sleep 1
 
   if is_running; then
-    echo "已启动 Codex。PID: $pid"
+    echo "已启动 ChatGPT。PID: $pid"
     echo "之后可以用：codex-proxy status / codex-proxy log / codex-proxy stop"
   else
-    echo "Codex 可能没有成功启动，请查看日志："
+    echo "ChatGPT 可能没有成功启动，请查看日志："
     echo "tail -n 100 \"$LOG_FILE\""
     exit 1
   fi
 }
 
 stop_codex() {
-  echo "正在退出 Codex..."
+  echo "正在退出 ChatGPT..."
 
-  osascript -e 'quit app "Codex"' >/dev/null 2>&1 || true
+  osascript -e 'quit app "ChatGPT"' >/dev/null 2>&1 || true
   sleep 1
 
   if is_running; then
@@ -112,19 +112,19 @@ stop_codex() {
   rm -f "$PID_FILE"
 
   if is_running; then
-    echo "Codex 仍在运行，可能需要手动退出。"
+    echo "ChatGPT 仍在运行，可能需要手动退出。"
     exit 1
   else
-    echo "Codex 已退出。"
+    echo "ChatGPT 已退出。"
   fi
 }
 
 status_codex() {
   if is_running; then
-    echo "Codex 正在运行："
+    echo "ChatGPT 正在运行："
     pgrep -fl "$EXE"
   else
-    echo "Codex 未运行。"
+    echo "ChatGPT 未运行。"
   fi
 }
 
