@@ -1,157 +1,1079 @@
 #!/bin/zsh
-
+#
+# codex-proxy —— 让 macOS 版 ChatGPT / Codex 桌面 App 走本地代理（Clash / v2rayN 等），
+#                无需开启 TUN 模式，也不影响其它 App。
+#
+# 为什么旧做法（只注入 HTTP_PROXY 等环境变量）在新版 App 上失效：
+#   1. 新版 App（26.6xx 起）已改成 Electron（Chromium）内核，界面与
+#      ws.chatgpt.com 等 WebSocket 都由 Chromium 网络栈收发。Chromium 在
+#      macOS 上【不读取】HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 环境变量，
+#      它只认系统代理；因此必须额外传 Electron/Chromium 的
+#      `--proxy-server` 参数，HTTP 与 WebSocket 才会一起走代理。
+#   2. App 的模型请求由后台常驻进程 `codex app-server`（Rust，读取环境变量）
+#      处理。它由常驻 supervisor（`app-server daemon pid-update-loop`）派生，
+#      重启 App 不会刷新它的环境变量，所以经常残留一个「没有代理」的守护进程，
+#      表现为一直转圈 / model 刷新超时。本脚本会在启动前停掉这种残留守护进程，
+#      让 App 重新派生带代理环境变量的守护进程。
+#
+# 用法：codex-proxy [start|stop|restart|status|log|doctor|persist]
+#
 set -u
 
-APP_BUNDLE="${CHATGPT_APP:-${CODEX_APP:-/Applications/ChatGPT.app}}"
-HTTP_PROXY_ADDR="${CODEX_HTTP_PROXY:-http://127.0.0.1:7890}"
-ALL_PROXY_ADDR="${CODEX_ALL_PROXY:-socks5://127.0.0.1:7890}"
-NO_PROXY_LIST="${CODEX_NO_PROXY:-localhost,127.0.0.1,::1}"
+PROG="codex-proxy"
 
+# ---------------------------------------------------------------------------
+# 常量与默认值
+# ---------------------------------------------------------------------------
+DEFAULT_PROXY="http://127.0.0.1:7890"
 LOG_DIR="$HOME/Library/Logs"
-LOG_FILE="$LOG_DIR/codex-proxy.log"
+LOG_FILE="${CODEX_PROXY_LOG:-$LOG_DIR/codex-proxy.log}"
 STATE_DIR="$HOME/Library/Application Support/codex-proxy"
 PID_FILE="$STATE_DIR/codex.pid"
+SESSION_FILE="$STATE_DIR/session.env"
 
-mkdir -p "$LOG_DIR" "$STATE_DIR"
+# App 位置：CHATGPT_APP / CODEX_APP 可覆盖；否则按常见路径 + Spotlight 查找
+APP_SEARCH_PATHS=(
+  "/Applications/ChatGPT.app"
+  "$HOME/Applications/ChatGPT.app"
+  "/Applications/Codex.app"
+  "$HOME/Applications/Codex.app"
+)
 
-get_executable() {
-  if [ ! -d "$APP_BUNDLE" ]; then
-    echo "错误：找不到 $APP_BUNDLE"
-    exit 1
+APP_BUNDLE=""
+APP_NAME="ChatGPT"
+BUNDLE_ID=""
+EXE=""
+IS_ELECTRON=0
+
+PROXY_ADDR=""
+PROXY_SOURCE=""
+ALL_PROXY_ADDR=""
+NO_PROXY_LIST=""
+BYPASS_LIST=""
+
+FORCE=0
+KEEP_DAEMON=0
+NO_CHECK=0
+
+# ---------------------------------------------------------------------------
+# 输出
+# ---------------------------------------------------------------------------
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+else
+  C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BOLD=""; C_DIM=""
+fi
+
+info()  { print -r -- "$*"; }
+ok()    { print -r -- "${C_GREEN}✓${C_RESET} $*"; }
+warn()  { print -r -- "${C_YELLOW}!${C_RESET} $*"; }
+err()   { print -r -- "${C_RED}✗${C_RESET} $*"; }
+die()   { print -u2 -r -- "${C_RED}✗${C_RESET} $*"; exit 1; }
+dim()   { print -r -- "${C_DIM}$*${C_RESET}"; }
+
+usage() {
+  cat <<EOF
+${C_BOLD}$PROG${C_RESET} —— 让 ChatGPT / Codex 桌面 App 走代理（不需要 TUN）
+
+用法：
+  $PROG start      启动 App（自动探测系统代理，注入 --proxy-server + 环境变量）
+  $PROG stop       完全退出 App（含后台 app-server 守护进程）
+  $PROG restart    重启 App
+  $PROG status     查看运行状态与「是否真的走了代理」
+  $PROG log        实时查看 App 输出日志
+  $PROG doctor     环境自检（代理连通性、端口、守护进程、排错建议）
+
+  $PROG persist    把代理写入 ~/.codex/.env，让后台 app-server 守护进程、
+                   终端 codex CLI 在任何启动方式下都走代理（手机端离线时必做）
+  $PROG persist off   撤销上面的写入（等价命令：$PROG unpersist）
+  $PROG persist show  查看 ~/.codex/.env 当前内容
+
+选项：
+  -f, --force        start 时即使 App 已在运行也强制重启
+      --keep-daemon  stop/start 时不处理后台 app-server 守护进程
+      --no-check     跳过代理连通性探测
+
+可用环境变量：
+  CHATGPT_APP / CODEX_APP   指定 App 路径（默认自动查找 ChatGPT.app）
+  CODEX_PROXY               代理地址，如 http://127.0.0.1:7890
+  CODEX_HTTP_PROXY          同上（兼容旧版写法）
+  CODEX_ALL_PROXY           ALL_PROXY 的值，默认与 CODEX_PROXY 相同
+  CODEX_NO_PROXY            不走代理的地址，逗号分隔
+                            默认 localhost,127.0.0.1,::1,*.local
+  CODEX_HOME                codex 配置目录（默认 ~/.codex），persist 写在其下的 .env
+  CODEX_PROXY_LOG           日志文件路径（默认 ~/Library/Logs/codex-proxy.log）
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 基础工具
+# ---------------------------------------------------------------------------
+mkdir -p "$LOG_DIR" "$STATE_DIR" 2>/dev/null || true
+
+# 把字符串转成字面量正则（用于 pgrep -f 匹配路径）
+regex_escape() {
+  printf '%s' "$1" | sed 's/[][\.^$*+?(){}|\\]/\\&/g'
+}
+
+plist_read() {
+  /usr/libexec/PlistBuddy -c "Print :$1" "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# App 定位
+# ---------------------------------------------------------------------------
+resolve_app() {
+  local soft="${1:-}"
+  local candidates=() c found explicit=""
+  if [ -n "${CHATGPT_APP:-}" ]; then explicit="$CHATGPT_APP"; fi
+  if [ -n "${CODEX_APP:-}" ]; then explicit="${explicit:-$CODEX_APP}"; fi
+
+  # 显式指定的路径优先且权威：写错了要报错，不能静默换成别的 App
+  if [ -n "$explicit" ]; then
+    if [ -d "$explicit" ]; then
+      APP_BUNDLE="$explicit"
+    else
+      [ "$soft" = "soft" ] && return 1
+      die "CHATGPT_APP/CODEX_APP 指定的路径不存在：$explicit"
+    fi
+  else
+    candidates=("${APP_SEARCH_PATHS[@]}")
+    for c in "${candidates[@]}"; do
+      if [ -d "$c" ]; then APP_BUNDLE="$c"; break; fi
+    done
   fi
 
-  local plist="$APP_BUNDLE/Contents/Info.plist"
-  local exe_name=""
-
-  if [ -f "$plist" ]; then
-    exe_name=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$plist" 2>/dev/null || true)
+  # 兜底：Spotlight 按 bundle id 查找
+  if [ -z "$APP_BUNDLE" ] && command -v mdfind >/dev/null 2>&1; then
+    found=$(mdfind "kMDItemCFBundleIdentifier == 'com.openai.codex'" 2>/dev/null | head -n 1)
+    if [ -n "$found" ] && [ -d "$found" ]; then APP_BUNDLE="$found"; fi
   fi
+
+  if [ -z "$APP_BUNDLE" ]; then
+    [ "$soft" = "soft" ] && return 1
+    die "找不到 ChatGPT.app。请用 CHATGPT_APP=/path/to/ChatGPT.app 指定路径。"
+  fi
+
+  local exe_name
+  exe_name=$(plist_read CFBundleExecutable)
+  APP_NAME=$(plist_read CFBundleDisplayName)
+  [ -z "$APP_NAME" ] && APP_NAME=$(plist_read CFBundleName)
+  [ -z "$APP_NAME" ] && APP_NAME="ChatGPT"
+  BUNDLE_ID=$(plist_read CFBundleIdentifier)
 
   if [ -n "$exe_name" ] && [ -x "$APP_BUNDLE/Contents/MacOS/$exe_name" ]; then
-    echo "$APP_BUNDLE/Contents/MacOS/$exe_name"
-    return
+    EXE="$APP_BUNDLE/Contents/MacOS/$exe_name"
+  elif [ -x "$APP_BUNDLE/Contents/MacOS/ChatGPT" ]; then
+    EXE="$APP_BUNDLE/Contents/MacOS/ChatGPT"
+  else
+    local cand
+    for cand in "$APP_BUNDLE"/Contents/MacOS/*; do
+      if [ -f "$cand" ] && [ -x "$cand" ]; then EXE="$cand"; break; fi
+    done
+  fi
+  [ -n "$EXE" ] || die "找不到可执行文件：$APP_BUNDLE/Contents/MacOS/"
+
+  if [ -f "$APP_BUNDLE/Contents/Resources/app.asar" ]; then IS_ELECTRON=1; fi
+}
+
+app_version() {
+  local v
+  v=$(plist_read CFBundleShortVersionString)
+  [ -z "$v" ] && v=$(plist_read CFBundleVersion)
+  print -r -- "${v:-未知}"
+}
+
+# ---------------------------------------------------------------------------
+# 代理配置
+# ---------------------------------------------------------------------------
+# 从 macOS 系统代理读取当前生效的代理地址（scutil --proxy）
+detect_system_proxy() {
+  local out enabled host port
+  out=$(scutil --proxy 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+
+  # scutil --proxy 每行形如 "  HTTPProxy : 127.0.0.1"，取最后一个字段
+  sysproxy_field() { printf '%s\n' "$out" | awk -v k="$1" '$1==k{print $NF; exit}'; }
+
+  enabled=$(sysproxy_field HTTPEnable)
+  host=$(sysproxy_field HTTPProxy)
+  port=$(sysproxy_field HTTPPort)
+  if [ "$enabled" = "1" ] && valid_proxy_host "$host" && valid_proxy_port "$port"; then
+    print -r -- "http://$host:$port"; return 0
   fi
 
-  if [ -x "$APP_BUNDLE/Contents/MacOS/ChatGPT" ]; then
-    echo "$APP_BUNDLE/Contents/MacOS/ChatGPT"
-    return
+  enabled=$(sysproxy_field HTTPSEnable)
+  host=$(sysproxy_field HTTPSProxy)
+  port=$(sysproxy_field HTTPSPort)
+  if [ "$enabled" = "1" ] && valid_proxy_host "$host" && valid_proxy_port "$port"; then
+    print -r -- "http://$host:$port"; return 0
   fi
 
-  local candidate
-  for candidate in "$APP_BUNDLE"/Contents/MacOS/*; do
-    if [ -f "$candidate" ] && [ -x "$candidate" ]; then
-      echo "$candidate"
-      return
+  enabled=$(sysproxy_field SOCKSEnable)
+  host=$(sysproxy_field SOCKSProxy)
+  port=$(sysproxy_field SOCKSPort)
+  if [ "$enabled" = "1" ] && valid_proxy_host "$host" && valid_proxy_port "$port"; then
+    print -r -- "socks5://$host:$port"; return 0
+  fi
+
+  return 1
+}
+
+# scutil 在某些状态下会输出空值（awk 取到字段分隔符 ":"），这里做一次校验
+valid_proxy_host() {
+  local h="$1"
+  [ -n "$h" ] || return 1
+  [ "${h#:}" = "$h" ] || return 1
+  return 0
+}
+
+valid_proxy_port() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
+resolve_proxy_config() {
+  local detected
+  if [ -n "${CODEX_PROXY:-}" ]; then
+    PROXY_ADDR="$CODEX_PROXY"; PROXY_SOURCE="环境变量 CODEX_PROXY"
+  elif [ -n "${CODEX_HTTP_PROXY:-}" ]; then
+    PROXY_ADDR="$CODEX_HTTP_PROXY"; PROXY_SOURCE="环境变量 CODEX_HTTP_PROXY"
+  elif detected=$(detect_system_proxy); then
+    PROXY_ADDR="$detected"; PROXY_SOURCE="macOS 系统代理"
+  else
+    PROXY_ADDR="$DEFAULT_PROXY"; PROXY_SOURCE="默认值（未检测到系统代理）"
+  fi
+
+  ALL_PROXY_ADDR="${CODEX_ALL_PROXY:-$PROXY_ADDR}"
+  # 去掉空格：NO_PROXY 会同时进环境变量和 Chromium 的 argv，带空格的参数不利于比对
+  NO_PROXY_LIST="${CODEX_NO_PROXY:-localhost,127.0.0.1,::1,*.local}"
+  NO_PROXY_LIST="${NO_PROXY_LIST// /}"
+
+  # Chromium 的 bypass 列表用分号分隔
+  BYPASS_LIST=$(printf '%s' "$NO_PROXY_LIST" | tr ',' ';')
+  case "$BYPASS_LIST" in
+    *'<local>'*) ;;
+    *) BYPASS_LIST="${BYPASS_LIST};<local>" ;;
+  esac
+}
+
+# 代理连通性探测：返回 HTTP 状态码，000 表示连不上
+check_proxy() {
+  local url="${CODEX_PROXY_CHECK_URL:-https://www.gstatic.com/generate_204}"
+  local code
+  # 注意：curl 失败时也会输出 000（退出码非 0），这里统一归一化，避免拼成 "000000"
+  code=$(curl -s -o /dev/null --max-time "${CODEX_PROXY_CHECK_TIMEOUT:-8}" \
+         -x "$PROXY_ADDR" -w '%{http_code}' "$url" 2>/dev/null)
+  case "$code" in
+    ''|*[!0-9]*) code="000" ;;
+  esac
+  print -r -- "$code"
+}
+
+# ---------------------------------------------------------------------------
+# 进程查询
+# ---------------------------------------------------------------------------
+# App 主进程（命令行以可执行文件路径开头）
+app_main_pids() {
+  [ -n "$EXE" ] || return 0
+  pgrep -f "^$(regex_escape "$EXE")" 2>/dev/null || true
+}
+
+# App bundle 内部的所有进程（渲染/GPU 辅助进程、cua_node、内置 codex 等）
+app_bundle_pids() {
+  [ -n "$APP_BUNDLE" ] || return 0
+  pgrep -f "^$(regex_escape "$APP_BUNDLE")/" 2>/dev/null || true
+}
+
+# 后台 app-server 受管守护进程及其 supervisor
+#   $2 必须以 codex 结尾（argv[0] 是 codex 二进制），避免误伤命令行里恰好含关键字的
+#   其它进程（脚本自己的 ps/awk 管道、grep 等）；中间参数放宽以兼容显式 socket 路径。
+daemon_pids() {
+  ps -axo pid=,command= 2>/dev/null | awk '
+    $2 ~ /codex$/ && ($0 ~ /app-server .*--managed-daemon/ ||
+                      $0 ~ /app-server daemon pid-update-loop/) { print $1 }'
+}
+
+# 进程是否有代理环境变量；有则打印它的 HTTPS_PROXY 值
+pid_proxy_env() {
+  ps eww -p "$1" 2>/dev/null | tr ' ' '\n' | sed -n 's/^HTTPS_PROXY=//p' | head -n 1
+}
+
+# 进程启动参数里的 --proxy-server 值
+# 进程启动参数里某个 --flag=value 的值
+pid_flag_value() {
+  ps -o command= -p "$1" 2>/dev/null | tr ' ' '\n' | sed -n "s|^$2=||p" | head -n 1
+}
+
+# 进程启动参数里的 --proxy-server 值
+pid_proxy_flag() {
+  pid_flag_value "$1" '--proxy-server'
+}
+
+first_line() {
+  printf '%s\n' "$1" | awk 'NF{print; exit}'
+}
+
+# ---------------------------------------------------------------------------
+# 启停
+# ---------------------------------------------------------------------------
+quit_app() {
+  local i leftover
+
+  # 1) 优雅退出（优先用 bundle id，避免 App 改名后失效）
+  #    只在 App 确实在运行时发 AppleScript，否则 osascript 会把 App 拉起来再退出
+  if [ -n "$(app_main_pids)" ]; then
+    if [ -n "$BUNDLE_ID" ]; then
+      osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
     fi
+    sleep 0.5
+    if [ -n "$(app_main_pids)" ] && [ -n "$APP_NAME" ]; then
+      osascript -e "quit app \"$APP_NAME\"" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # 2) 给 App 最多 8 秒自然退出（正常退出时它自己会收掉辅助进程）
+  for i in {1..16}; do
+    [ -z "$(app_main_pids)" ] && break
+    sleep 0.5
   done
 
-  echo "错误：找不到 ChatGPT 可执行文件"
-  exit 1
-}
-
-EXE="$(get_executable)"
-
-is_running() {
-  pgrep -f "$EXE" >/dev/null 2>&1
-}
-
-start_codex() {
-  echo "准备启动 ChatGPT with proxy..."
-  echo "App: $APP_BUNDLE"
-  echo "Executable: $EXE"
-  echo "HTTP_PROXY: $HTTP_PROXY_ADDR"
-  echo "ALL_PROXY: $ALL_PROXY_ADDR"
-  echo "Log: $LOG_FILE"
-
-  # 先退出普通方式启动的 Codex，避免残留一个不带代理的进程
-  osascript -e 'quit app "ChatGPT"' >/dev/null 2>&1 || true
-  sleep 1
-
-  # 如果还没退出，强制结束
-  pkill -f "$EXE" >/dev/null 2>&1 || true
-  sleep 1
-
-  nohup env \
-    HTTP_PROXY="$HTTP_PROXY_ADDR" \
-    HTTPS_PROXY="$HTTP_PROXY_ADDR" \
-    ALL_PROXY="$ALL_PROXY_ADDR" \
-    http_proxy="$HTTP_PROXY_ADDR" \
-    https_proxy="$HTTP_PROXY_ADDR" \
-    all_proxy="$ALL_PROXY_ADDR" \
-    NO_PROXY="$NO_PROXY_LIST" \
-    no_proxy="$NO_PROXY_LIST" \
-    "$EXE" >> "$LOG_FILE" 2>&1 < /dev/null &
-
-  local pid=$!
-  echo "$pid" > "$PID_FILE"
-  disown "$pid" 2>/dev/null || true
-
-  sleep 1
-
-  if is_running; then
-    echo "已启动 ChatGPT。PID: $pid"
-    echo "之后可以用：codex-proxy status / codex-proxy log / codex-proxy stop"
-  else
-    echo "ChatGPT 可能没有成功启动，请查看日志："
-    echo "tail -n 100 \"$LOG_FILE\""
-    exit 1
+  # 3) 还在：对主进程发 TERM，再等 5 秒
+  if [ -n "$(app_main_pids)" ]; then
+    pkill -f "^$(regex_escape "$EXE")" >/dev/null 2>&1 || true
+    for i in {1..10}; do
+      [ -z "$(app_main_pids)" ] && break
+      sleep 0.5
+    done
   fi
-}
 
-stop_codex() {
-  echo "正在退出 ChatGPT..."
+  # 4) 清理 bundle 内残留进程（Chromium 辅助进程 / cua_node / 内置 codex）：
+  #    先 TERM 并给足 5 秒，再 KILL —— 内置 codex app-server 落盘需要时间
+  leftover=$(app_bundle_pids)
+  if [ -n "$leftover" ]; then
+    print -r -- "$leftover" | xargs kill >/dev/null 2>&1 || true
+    for i in {1..10}; do
+      [ -z "$(app_bundle_pids)" ] && break
+      sleep 0.5
+    done
+    leftover=$(app_bundle_pids)
+    if [ -n "$leftover" ]; then
+      print -r -- "$leftover" | xargs kill -9 >/dev/null 2>&1 || true
+      sleep 1
+    fi
+  fi
 
-  osascript -e 'quit app "ChatGPT"' >/dev/null 2>&1 || true
-  sleep 1
-
-  if is_running; then
-    pkill -f "$EXE" >/dev/null 2>&1 || true
+  # 5) 兜底：主进程仍顽固存活才 KILL
+  if [ -n "$(app_main_pids)" ]; then
+    pkill -9 -f "^$(regex_escape "$EXE")" >/dev/null 2>&1 || true
     sleep 1
   fi
 
   rm -f "$PID_FILE"
+}
 
-  if is_running; then
-    echo "ChatGPT 仍在运行，可能需要手动退出。"
-    exit 1
+# 停掉后台 app-server 守护进程（含 supervisor），失败则强杀
+stop_daemon() {
+  local cli pids codex_path
+  codex_path=$(command -v codex 2>/dev/null || true)
+
+  for cli in "${CODEX_CLI:-}" "$codex_path"; do
+    [ -n "$cli" ] && [ -x "$cli" ] || continue
+    if "$cli" app-server daemon stop >/dev/null 2>&1; then break; fi
+  done
+  sleep 1
+
+  pids=$(daemon_pids)
+  if [ -n "$pids" ]; then
+    print -r -- "$pids" | xargs kill >/dev/null 2>&1 || true
+    sleep 2
+    pids=$(daemon_pids)
+  fi
+
+  if [ -n "$pids" ]; then
+    print -r -- "$pids" | xargs kill -9 >/dev/null 2>&1 || true
+    sleep 1
+    pids=$(daemon_pids)
+  fi
+
+  [ -z "$pids" ]
+}
+
+# 守护进程的代理来源：
+#   "env:<值>" 进程环境变量里有代理（由 App 派生时继承）
+#   "dotenv"   环境里没有，但 ~/.codex/.env 里配置了代理（codex 会自己读取）
+#   ""         两者都没有 → 后端请求会超时
+daemon_proxy_note() {
+  local denv
+  denv=$(pid_proxy_env "$1")
+  if [ -n "$denv" ]; then print -r -- "env:$denv"; return 0; fi
+  if env_file_has_block; then print -r -- "dotenv"; return 0; fi
+  print -r -- ""
+}
+
+# 守护进程是否走代理（没有守护进程时返回 2）
+daemon_proxy_state() {
+  local pids pid
+  pids=$(daemon_pids)
+  if [ -z "$pids" ]; then return 2; fi
+  for pid in ${(f)pids}; do
+    if [ -z "$(daemon_proxy_note "$pid")" ]; then return 1; fi
+  done
+  return 0
+}
+
+wait_for_app() {
+  local i
+  # 冷启动（app.asar 有 480MB）可能较慢，最多等 30 秒
+  for i in {1..60}; do
+    [ -n "$(app_main_pids)" ] && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+write_session_file() {
+  local pid="$1"
+  {
+    print -r -- "PID=$pid"
+    print -r -- "APP=$APP_BUNDLE"
+    print -r -- "PROXY=$PROXY_ADDR"
+    print -r -- "ALL_PROXY=$ALL_PROXY_ADDR"
+    print -r -- "NO_PROXY=$NO_PROXY_LIST"
+    print -r -- "BYPASS=$BYPASS_LIST"
+    print -r -- "STARTED=$(date '+%Y-%m-%d %H:%M:%S')"
+  } > "$SESSION_FILE"
+}
+
+launch_app() {
+  local pid
+
+  info ""
+  info "${C_BOLD}启动 $APP_NAME${C_RESET}"
+  info "  App        : $APP_BUNDLE"
+  info "  版本       : $(app_version)$([ "$IS_ELECTRON" = 1 ] && print -r -- ' (Electron)')"
+  info "  代理       : $PROXY_ADDR  ${C_DIM}($PROXY_SOURCE)${C_RESET}"
+  info "  ALL_PROXY  : $ALL_PROXY_ADDR"
+  info "  不走代理   : $NO_PROXY_LIST"
+  info "  日志       : $LOG_FILE"
+  info ""
+
+  # open 不会给已在运行的实例重新传参：必须确认旧进程真的退干净了
+  if [ -n "$(app_main_pids)" ]; then
+    err "旧进程（PID $(first_line "$(app_main_pids)" | tr '\n' ' ')）仍未退出，"
+    err "此时 open 只会激活旧实例、--proxy-server 不会生效。"
+    info "  请手动退出 App 后重试，或执行：pkill -9 -f '^$EXE'"
+    return 1
+  fi
+
+  # 日志超过 5MB 先轮转一次
+  if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE" | tr -d ' ')" -gt 5242880 ] 2>/dev/null; then
+    mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+    dim "日志已轮转到 $LOG_FILE.1"
+  fi
+
+  # 新版 App 是 Electron：必须用 --proxy-server，环境变量对 Chromium 无效
+  if [ "$IS_ELECTRON" = 1 ]; then
+    ok "已注入 Chromium 参数 --proxy-server=$PROXY_ADDR（HTTP + WebSocket 一起走代理）"
   else
-    echo "ChatGPT 已退出。"
+    warn "未检测到 Electron 内核，仅注入环境变量"
+  fi
+
+  # open --stdout/--stderr 必须写在 --args 之前，否则会被当成 App 参数
+  local launched=1
+  if open -a "$APP_BUNDLE" \
+      --stdout "$LOG_FILE" --stderr "$LOG_FILE" \
+      --env HTTP_PROXY="$PROXY_ADDR" \
+      --env HTTPS_PROXY="$PROXY_ADDR" \
+      --env ALL_PROXY="$ALL_PROXY_ADDR" \
+      --env NO_PROXY="$NO_PROXY_LIST" \
+      --env http_proxy="$PROXY_ADDR" \
+      --env https_proxy="$PROXY_ADDR" \
+      --env all_proxy="$ALL_PROXY_ADDR" \
+      --env no_proxy="$NO_PROXY_LIST" \
+      --env CODEX_PROXY_MANAGED_BY="$PROG" \
+      --args --proxy-server="$PROXY_ADDR" \
+             --proxy-bypass-list="$BYPASS_LIST"; then
+    launched=0
+  fi
+
+  # 兜底：open 不支持 --env（老系统）时直接拉起可执行文件
+  if [ "$launched" != 0 ]; then
+    warn "open 启动失败（可能系统版本不支持 --env），改用直接启动…"
+    nohup env \
+      HTTP_PROXY="$PROXY_ADDR" HTTPS_PROXY="$PROXY_ADDR" ALL_PROXY="$ALL_PROXY_ADDR" \
+      http_proxy="$PROXY_ADDR" https_proxy="$PROXY_ADDR" all_proxy="$ALL_PROXY_ADDR" \
+      NO_PROXY="$NO_PROXY_LIST" no_proxy="$NO_PROXY_LIST" \
+      CODEX_PROXY_MANAGED_BY="$PROG" \
+      "$EXE" --proxy-server="$PROXY_ADDR" --proxy-bypass-list="$BYPASS_LIST" \
+      >> "$LOG_FILE" 2>&1 < /dev/null &
+    disown 2>/dev/null || true
+  fi
+
+  if ! wait_for_app; then
+    err "$APP_NAME 没有启动成功，请查看日志：tail -n 100 \"$LOG_FILE\""
+    return 1
+  fi
+
+  pid=$(first_line "$(app_main_pids)")
+  print -r -- "$pid" > "$PID_FILE"
+  write_session_file "$pid"
+
+  # 校验参数与环境变量是否真的生效
+  local flag env rc=0
+  flag=$(pid_proxy_flag "$pid")
+  env=$(pid_proxy_env "$pid")
+  info ""
+  if [ "$flag" = "$PROXY_ADDR" ]; then
+    ok "运行中（PID $pid）— Electron 代理参数已生效"
+  else
+    err "运行中（PID $pid）但 --proxy-server 未生效（当前值：${flag:-无}）"
+  fi
+  if [ -n "$env" ]; then
+    ok "代理环境变量已注入（HTTPS_PROXY=$env）— 子进程 / codex CLI 同样走代理"
+  elif env_file_has_block; then
+    dim "进程环境里没有代理变量，但 $(codex_env_file) 已配置：Rust 侧（codex CLI / app-server）仍走代理"
+  else
+    warn "未检测到代理环境变量，子进程可能不走代理"
+  fi
+  [ "$flag" = "$PROXY_ADDR" ] || rc=1
+
+  info ""
+  info "提示：App 会在需要时派生子进程（含 app-server 守护进程），它们会继承上面的代理环境变量。"
+  info "      用 ${C_BOLD}$PROG status${C_RESET} 查看实时状态，${C_BOLD}$PROG log${C_RESET} 查看日志。"
+  if ! env_file_has_block; then
+    info ""
+    dim "手机端远程连接一直显示「Mac 离线」时，执行 $PROG persist 可让后台守护进程在"
+    dim "任何启动方式下都走代理（写入 $(codex_env_file)，可用 $PROG persist off 撤销）。"
+  fi
+  return $rc
+}
+
+start_codex() {
+  resolve_app
+  resolve_proxy_config
+
+  local main_pids flag env bypass
+  main_pids=$(app_main_pids)
+
+  if [ -n "$main_pids" ] && [ "$FORCE" = 0 ]; then
+    local pid; pid=$(first_line "$main_pids")
+    flag=$(pid_proxy_flag "$pid")
+    bypass=$(pid_flag_value "$pid" '--proxy-bypass-list')
+    env=$(pid_proxy_env "$pid")
+    local env_ok=1
+    { [ -n "$env" ] || env_file_has_block; } && env_ok=0
+    if [ "$flag" = "$PROXY_ADDR" ] && [ "$bypass" = "$BYPASS_LIST" ] && [ "$env_ok" = 0 ]; then
+      ok "$APP_NAME 已在运行（PID $pid），代理配置正确，无需重启。"
+      if [ "$KEEP_DAEMON" = 0 ] && [ -n "$(daemon_pids)" ] && ! daemon_proxy_state; then
+        warn "后台 app-server 守护进程没有代理环境变量，正在重启它…"
+        stop_daemon || warn "守护进程未能完全停止，请稍后重试"
+      fi
+      return 0
+    fi
+    if [ -z "$flag" ]; then
+      warn "已在运行（PID $pid）但不是由本脚本启动（没有 --proxy-server）。"
+      warn "新版 Electron App 不读取环境变量，它的流量没有走代理，将重启。"
+    elif [ "$flag" != "$PROXY_ADDR" ]; then
+      warn "已在运行（PID $pid）但代理为 $flag，与当前配置 $PROXY_ADDR 不一致，将重启。"
+    elif [ "$bypass" != "$BYPASS_LIST" ]; then
+      warn "已在运行（PID $pid）但不走代理列表已变化，将重启。"
+    elif [ "$env_ok" != 0 ]; then
+      warn "已在运行（PID $pid）但缺少代理环境变量，子进程不会走代理，将重启。"
+    fi
+    info ""
+  fi
+
+  # 代理连通性预检（只警告，不阻止启动）
+  if [ "$NO_CHECK" = 0 ]; then
+    local code
+    code=$(check_proxy)
+    if [ "$code" = "000" ]; then
+      warn "代理 $PROXY_ADDR 连不上（探测 $([ -n "${CODEX_PROXY_CHECK_URL:-}" ] && print -r -- "$CODEX_PROXY_CHECK_URL" || print -r -- 'https://www.gstatic.com/generate_204') 失败）。"
+      warn "请确认代理软件已启动、端口正确；端口不对可用 CODEX_PROXY=http://127.0.0.1:7897 指定。"
+    else
+      ok "代理连通性正常（$PROXY_ADDR → HTTP $code）"
+    fi
+  fi
+
+  if [ -n "$(app_main_pids)" ]; then
+    info "正在退出已有进程…"
+    quit_app
+  fi
+
+  if [ "$KEEP_DAEMON" = 0 ]; then
+    if [ -n "$(daemon_pids)" ] && ! daemon_proxy_state; then
+      info "检测到没有代理环境变量的后台 app-server 守护进程，正在重建（会中断后台任务）…"
+      stop_daemon || warn "守护进程未能完全停止，App 可能继续复用旧环境"
+    fi
+  elif [ -n "$(daemon_pids)" ] && ! daemon_proxy_state; then
+    warn "--keep-daemon：保留了没有代理环境变量的守护进程，模型请求可能仍然超时。"
+  fi
+
+  launch_app
+}
+
+stop_codex() {
+  local app_found=1 failed=0
+  resolve_app soft && app_found=0
+  resolve_proxy_config
+
+  if [ "$app_found" = 0 ]; then
+    info "正在退出 $APP_NAME …"
+    quit_app
+
+    if [ -n "$(app_main_pids)" ]; then
+      err "$APP_NAME 仍在运行，可能需要手动退出。"
+      failed=1
+    else
+      ok "$APP_NAME 已退出。"
+    fi
+  else
+    warn "找不到 App bundle，跳过 App 部分，只处理后端守护进程。"
+  fi
+
+  if [ "$KEEP_DAEMON" = 0 ]; then
+    if [ -n "$(daemon_pids)" ]; then
+      info "正在停止后台 app-server 守护进程（会中断后台任务）…"
+      if stop_daemon; then
+        ok "后台守护进程已停止。"
+      else
+        warn "仍有守护进程残留，可用 $PROG status 查看。"
+      fi
+    else
+      dim "后台 app-server 守护进程未运行。"
+    fi
+  elif [ -n "$(daemon_pids)" ]; then
+    dim "--keep-daemon：保留后台 app-server 守护进程。"
+  fi
+
+  rm -f "$SESSION_FILE"
+  return $failed
+}
+
+# ---------------------------------------------------------------------------
+# 状态与诊断
+# ---------------------------------------------------------------------------
+status_codex() {
+  local app_found=1
+  resolve_app soft || app_found=0
+  resolve_proxy_config
+
+  local main_pids pid flag bypass env pidfile=""
+  main_pids=$(app_main_pids)
+
+  info "${C_BOLD}$APP_NAME 状态${C_RESET}"
+  if [ "$app_found" = 0 ]; then
+    warn "找不到 App bundle（可用 CHATGPT_APP 指定路径）"
+  else
+    info "  App        : $APP_BUNDLE"
+    info "  版本       : $(app_version)$([ "$IS_ELECTRON" = 1 ] && print -r -- ' (Electron)')"
+    info "  期望代理   : $PROXY_ADDR  ${C_DIM}($PROXY_SOURCE)${C_RESET}"
+    info ""
+  fi
+
+  if [ -z "$main_pids" ]; then
+    info "  App 进程   : ${C_YELLOW}未运行${C_RESET}"
+  else
+    pid=$(first_line "$main_pids")
+    [ -f "$PID_FILE" ] && pidfile=$(cat "$PID_FILE" 2>/dev/null)
+    # 陈旧的状态文件不展示，避免和真实进程混淆
+    [ "$pidfile" = "$pid" ] || pidfile=""
+    flag=$(pid_proxy_flag "$pid")
+    bypass=$(pid_flag_value "$pid" '--proxy-bypass-list')
+    env=$(pid_proxy_env "$pid")
+
+    info "  App 进程   : ${C_GREEN}运行中${C_RESET}（PID $pid${pidfile:+，本脚本记录 $pidfile}）"
+    if [ "$flag" = "$PROXY_ADDR" ]; then
+      ok "  Chromium 代理参数：--proxy-server=$flag（与配置一致）"
+      [ "$bypass" = "$BYPASS_LIST" ] || warn "  不走代理列表为 ${bypass:-无}，与配置 $BYPASS_LIST 不一致"
+    elif [ -n "$flag" ]; then
+      warn "  Chromium 代理参数：--proxy-server=$flag（与当前配置 $PROXY_ADDR 不一致）"
+    else
+      err "  未注入 --proxy-server —— 新版 Electron App 忽略环境变量，它的流量没有走代理！"
+      dim "     修复：$PROG restart"
+    fi
+
+    if [ -n "$env" ]; then
+      ok "  代理环境变量：HTTPS_PROXY=$env（子进程生效）"
+    elif env_file_has_block; then
+      dim "  进程没有代理环境变量，但 $(codex_env_file) 已配置（Rust 侧仍走代理）"
+    else
+      warn "  没有代理环境变量，App 派生的 codex CLI 子进程可能不走代理"
+    fi
+  fi
+
+  # 后台守护进程
+  local pids dpid dnote
+  pids=$(daemon_pids)
+  info ""
+  if [ -z "$pids" ]; then
+    dim "  后台受管守护进程（app-server daemon）：未运行"
+  else
+    for dpid in ${(f)pids}; do
+      dnote=$(daemon_proxy_note "$dpid")
+      case "$dnote" in
+        env:*)
+          ok "  后台受管守护进程 $dpid：代理正常（HTTPS_PROXY=${dnote#env:}）"
+          ;;
+        dotenv)
+          ok "  后台受管守护进程 $dpid：代理正常（读取 $(codex_env_file)）"
+          ;;
+        *)
+          err "  后台受管守护进程 $dpid：没有代理配置 —— 模型请求会超时"
+          dim "     修复：$PROG restart 或 $PROG persist"
+          ;;
+      esac
+    done
   fi
 }
 
-status_codex() {
-  if is_running; then
-    echo "ChatGPT 正在运行："
-    pgrep -fl "$EXE"
-  else
-    echo "ChatGPT 未运行。"
+doctor_codex() {
+  resolve_app
+  resolve_proxy_config
+
+  local problems=0
+  info "${C_BOLD}$PROG 自检${C_RESET}"
+  info ""
+
+  # 1. App
+  info "${C_BOLD}[1/7] App${C_RESET}"
+  ok "路径：$APP_BUNDLE"
+  ok "版本：$(app_version)　内核：$([ "$IS_ELECTRON" = 1 ] && print -r -- 'Electron/Chromium' || print -r -- '未知（非 Electron）')"
+  if [ "$IS_ELECTRON" = 0 ]; then
+    warn "没检测到 app.asar，可能不是新版 Electron App，--proxy-server 未必需要"
   fi
+
+  # 2. 代理配置
+  info ""
+  info "${C_BOLD}[2/7] 代理配置${C_RESET}"
+  ok "使用代理：$PROXY_ADDR（来源：$PROXY_SOURCE）"
+  local sysp
+  if sysp=$(detect_system_proxy); then
+    if [ "$sysp" = "$PROXY_ADDR" ]; then
+      ok "与 macOS 系统代理一致：$sysp"
+    else
+      warn "macOS 系统代理是 $sysp，与脚本使用的 $PROXY_ADDR 不同"
+      dim "     说明：Chromium 用 --proxy-server；Sparkle 更新等系统级请求仍走系统代理"
+    fi
+  else
+    warn "macOS 系统代理未开启（只影响非 Chromium 部分，如 App 自动更新）"
+  fi
+
+  # 3. 连通性
+  info ""
+  info "${C_BOLD}[3/7] 代理连通性${C_RESET}"
+  if [ "$NO_CHECK" = 1 ]; then
+    dim "已跳过（--no-check）"
+  else
+    local code t0 t1
+    t0=$(date +%s)
+    code=$(check_proxy)
+    t1=$(date +%s)
+    if [ "$code" = "000" ]; then
+      err "通过 $PROXY_ADDR 无法联网（耗时 $((t1 - t0))s）"
+      dim "     检查：代理软件是否在运行 / 端口是否写对 / 是否允许本机连接"
+      problems=$((problems + 1))
+    else
+      ok "通过 $PROXY_ADDR 联网正常（HTTP $code，$((t1 - t0))s）"
+    fi
+  fi
+
+  # 4. App 运行状态
+  info ""
+  info "${C_BOLD}[4/7] App 运行状态${C_RESET}"
+  local main_pids pid flag env
+  main_pids=$(app_main_pids)
+  if [ -z "$main_pids" ]; then
+    dim "App 未运行"
+  else
+    pid=$(first_line "$main_pids")
+    flag=$(pid_proxy_flag "$pid")
+    env=$(pid_proxy_env "$pid")
+    info "PID：$pid"
+    if [ "$flag" = "$PROXY_ADDR" ]; then
+      ok "--proxy-server=$flag"
+    elif [ -n "$flag" ]; then
+      warn "--proxy-server=$flag（与配置 $PROXY_ADDR 不一致）"; problems=$((problems + 1))
+    else
+      err "没有 --proxy-server：Chromium 不会走代理"; problems=$((problems + 1))
+    fi
+    if [ -n "$env" ]; then
+      ok "HTTPS_PROXY=$env"
+    elif env_file_has_block; then
+      dim "进程环境里没有代理变量，但 $(codex_env_file) 已配置（Rust 侧仍走代理）"
+    else
+      warn "没有代理环境变量（App 派生的 codex CLI 子进程不会走代理）"
+    fi
+  fi
+
+  # 5. 守护进程
+  info ""
+  info "${C_BOLD}[5/7] 后台受管守护进程（app-server daemon）${C_RESET}"
+  local pids
+  pids=$(daemon_pids)
+  if [ -z "$pids" ]; then
+    dim "未运行（App 需要时会自动派生，并继承代理环境变量）"
+    dim "     App 自己的 app-server 子进程由 App 管理，不在本脚本管辖范围内"
+  else
+    local dpid dnote
+    for dpid in ${(f)pids}; do
+      dnote=$(daemon_proxy_note "$dpid")
+      case "$dnote" in
+        env:*)  ok "$dpid：代理正常（HTTPS_PROXY=${dnote#env:}）" ;;
+        dotenv) ok "$dpid：代理正常（读取 $(codex_env_file)）" ;;
+        *)      err "$dpid：没有代理配置，模型请求会超时"
+                dim "     修复：$PROG persist（持久）或 $PROG restart（重建）"
+                problems=$((problems + 1)) ;;
+      esac
+    done
+  fi
+
+  # 6. 持久化配置
+  info ""
+  info "${C_BOLD}[6/7] 持久化代理（$(codex_env_file)）${C_RESET}"
+  if env_file_has_block; then
+    ok "已写入托管配置（Rust 侧：app-server / 守护进程 / 终端 codex 始终走代理）"
+  else
+    dim "未写入：后台守护进程与终端 codex 只在继承到环境变量时才走代理"
+    dim "     手机端一直显示「Mac 离线」时建议执行：$PROG persist"
+  fi
+
+  # 7. 日志
+  info ""
+  info "${C_BOLD}[7/7] 日志${C_RESET}"
+  if [ -f "$LOG_FILE" ]; then
+    ok "$LOG_FILE（$(wc -c < "$LOG_FILE" | tr -d ' ') 字节）"
+  else
+    dim "$LOG_FILE 尚未生成（启动 App 后才有）"
+  fi
+
+  info ""
+  if [ "$problems" = 0 ]; then
+    ok "自检通过。"
+  else
+    err "发现 $problems 个问题，建议运行：$PROG restart"
+  fi
+  return $((problems > 0))
 }
 
 show_log() {
-  touch "$LOG_FILE"
+  [ -f "$LOG_FILE" ] || : > "$LOG_FILE"
+  info "${C_DIM}日志：$LOG_FILE（Ctrl-C 退出）${C_RESET}"
   tail -f "$LOG_FILE"
 }
 
-case "${1:-start}" in
-  start)
-    start_codex
+# ---------------------------------------------------------------------------
+# 持久化代理配置：~/.codex/.env
+#
+# codex CLI / app-server / 后台守护进程（Rust）都会读取 $CODEX_HOME/.env，
+# 因此在里面写入代理变量后，即使进程不是由本脚本启动（例如 App 从访达冷启动、
+# 或守护进程被 launchd 拉起），后端请求依然走代理。
+# ---------------------------------------------------------------------------
+# 解析 .env 的真实写入目标：
+#   - 尊重 CODEX_HOME
+#   - 若 .env 是符号链接（用 dotfiles 管理的情况），写真实目标而不是把链接替换成普通文件
+codex_env_file() {
+  local f="${CODEX_HOME:-$HOME/.codex}/.env" resolved
+  if [ -L "$f" ]; then
+    resolved=$(readlink -f "$f" 2>/dev/null || true)
+    if [ -n "$resolved" ]; then print -r -- "$resolved"; return 0; fi
+  fi
+  print -r -- "$f"
+}
+
+ENV_MARK_BEGIN="# >>> codex-proxy >>>"
+ENV_MARK_END="# <<< codex-proxy <<<"
+
+# 托管块状态：ok / none / malformed（有 BEGIN 没 END、只有 END、或顺序颠倒）
+env_block_state() {
+  local f; f=$(codex_env_file)
+  [ -f "$f" ] || { print -r -- "none"; return 0; }
+  awk -v b="$ENV_MARK_BEGIN" -v e="$ENV_MARK_END" '
+    { line = $0; sub(/\r$/, "", line) }
+    line == b && !seen_b { seen_b = NR }
+    line == e && seen_b && !seen_e { seen_e = NR }
+    END {
+      if (!seen_b && !seen_e) print "none"
+      else if (seen_b && seen_e && seen_b < seen_e) print "ok"
+      else print "malformed"
+    }
+  ' "$f"
+}
+
+# 只有完整、成对的托管块才算数（避免把用户手写的半个块当成自己的）
+env_file_has_block() {
+  [ "$(env_block_state)" = "ok" ]
+}
+
+env_block_malformed_hint() {
+  local f; f=$(codex_env_file)
+  err "$f 里的托管标记不完整（缺少 $ENV_MARK_END 或顺序颠倒），为避免误删你的配置，脚本不做任何修改。"
+  info "  请手工修正后重试：确保 $ENV_MARK_BEGIN 与 $ENV_MARK_END 成对出现。"
+}
+
+# 删除托管块（调用前必须确认 env_block_state = ok）；按行精确匹配，容忍 CRLF
+strip_env_block() {
+  local src="$1" dst="$2"
+  awk -v b="$ENV_MARK_BEGIN" -v e="$ENV_MARK_END" '
+    { line = $0; sub(/\r$/, "", line) }
+    line == b { skip = 1; next }
+    line == e { skip = 0; next }
+    skip != 1 { print }
+  ' "$src" > "$dst"
+}
+
+file_mode() {
+  stat -f '%Lp' "$1" 2>/dev/null || print -r -- ""
+}
+
+persist_codex() {
+  resolve_proxy_config
+  local f tmp state orig_mode dir
+  f=$(codex_env_file)
+  state=$(env_block_state)
+
+  case "$state" in
+    malformed) env_block_malformed_hint; return 1 ;;
+  esac
+
+  orig_mode=$(file_mode "$f")
+  dir=$(dirname "$f")
+  mkdir -p "$dir" || die "无法创建目录 $dir"
+  # 临时文件放在目标同目录，保证 mv 是原子替换
+  tmp="$dir/.env.codex-proxy.$$"
+  : > "$tmp" || die "无法在 $dir 下创建临时文件"
+
+  if [ -f "$f" ]; then
+    strip_env_block "$f" "$tmp" || { rm -f "$tmp"; die "读取 $f 失败"; }
+    ok "已保留 $f 中其它内容"
+  fi
+
+  # 去掉尾部空行后追加托管块
+  awk 'NF{last=NR} {lines[NR]=$0} END{for(i=1;i<=last;i++) print lines[i]}' "$tmp" > "$tmp.trim" \
+    || { rm -f "$tmp" "$tmp.trim"; die "处理 $f 失败"; }
+  mv "$tmp.trim" "$tmp" || { rm -f "$tmp" "$tmp.trim"; die "处理 $f 失败"; }
+
+  {
+    [ -s "$tmp" ] && print -r -- ""
+    print -r -- "$ENV_MARK_BEGIN"
+    print -r -- "HTTP_PROXY=$PROXY_ADDR"
+    print -r -- "HTTPS_PROXY=$PROXY_ADDR"
+    print -r -- "ALL_PROXY=$ALL_PROXY_ADDR"
+    print -r -- "NO_PROXY=$NO_PROXY_LIST"
+    print -r -- "http_proxy=$PROXY_ADDR"
+    print -r -- "https_proxy=$PROXY_ADDR"
+    print -r -- "all_proxy=$ALL_PROXY_ADDR"
+    print -r -- "no_proxy=$NO_PROXY_LIST"
+    print -r -- "$ENV_MARK_END"
+  } >> "$tmp"
+
+  chmod "${orig_mode:-600}" "$tmp" 2>/dev/null || chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$f" || { rm -f "$tmp"; die "写入 $f 失败"; }
+  ok "已写入 $f"
+  info "  代理：$PROXY_ADDR"
+  info "  权限：$(file_mode "$f")"
+  info "  作用：codex CLI / app-server / 后台守护进程在【任何方式启动】时都走代理"
+  info "  撤销：$PROG persist off"
+}
+
+unpersist_codex() {
+  local f tmp state orig_mode
+  f=$(codex_env_file)
+  state=$(env_block_state)
+
+  case "$state" in
+    none)
+      dim "$f 中没有本脚本写入的配置，无需清理。"
+      return 0
+      ;;
+    malformed)
+      env_block_malformed_hint
+      return 1
+      ;;
+  esac
+
+  orig_mode=$(file_mode "$f")
+  tmp="$(dirname "$f")/.env.codex-proxy.$$"
+  : > "$tmp" || die "无法在 $(dirname "$f") 下创建临时文件"
+  strip_env_block "$f" "$tmp" || { rm -f "$tmp"; die "处理 $f 失败"; }
+
+  if [ -z "$(tr -d '[:space:]' < "$tmp")" ]; then
+    rm -f "$tmp" "$f"
+    ok "已删除 $f（原本只有本脚本写入的内容）"
+  else
+    chmod "${orig_mode:-600}" "$tmp" 2>/dev/null || chmod 600 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$f" || { rm -f "$tmp"; die "写入 $f 失败"; }
+    ok "已从 $f 移除本脚本写入的代理配置"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+CMD=""
+SUBCMD=""
+
+# 选项可以写在子命令前或后：codex-proxy -f start / codex-proxy start -f 都支持
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f|--force) FORCE=1 ;;
+    --keep-daemon) KEEP_DAEMON=1 ;;
+    --no-check) NO_CHECK=1 ;;
+    -h|--help) usage; exit 0 ;;
+    on|off|show|remove|clear)
+      if [ "$CMD" = "persist" ]; then
+        SUBCMD="$1"
+      else
+        err "未知参数：$1"; info ""; usage; exit 1
+      fi
+      ;;
+    -*)
+      err "未知参数：$1"; info ""; usage; exit 1
+      ;;
+    *)
+      if [ -z "$CMD" ]; then
+        CMD="$1"
+      else
+        err "多余参数：$1"; info ""; usage; exit 1
+      fi
+      ;;
+  esac
+  shift
+done
+
+CMD="${CMD:-start}"
+
+case "$CMD" in
+  start)   start_codex ;;
+  stop)    stop_codex ;;
+  restart) FORCE=1; start_codex ;;
+  status)  status_codex ;;
+  log)     show_log ;;
+  doctor)  doctor_codex ;;
+  persist)
+    case "$SUBCMD" in
+      off|remove|clear) unpersist_codex ;;
+      show)
+        if [ -f "$(codex_env_file)" ]; then
+          info "${C_BOLD}$(codex_env_file)${C_RESET}"
+          cat "$(codex_env_file)"
+        else
+          dim "$(codex_env_file) 不存在。"
+        fi
+        ;;
+      *) persist_codex ;;
+    esac
     ;;
-  stop)
-    stop_codex
-    ;;
-  restart)
-    stop_codex
-    start_codex
-    ;;
-  status)
-    status_codex
-    ;;
-  log)
-    show_log
-    ;;
+  unpersist) unpersist_codex ;;
+  help|-h|--help) usage ;;
   *)
-    echo "用法：codex-proxy [start|stop|restart|status|log]"
+    err "未知命令：$CMD"
+    info ""
+    usage
     exit 1
     ;;
 esac
