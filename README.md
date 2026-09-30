@@ -9,8 +9,6 @@ codex-proxy persist   # 让后台 app-server 守护进程也走代理（手机�
 codex-proxy status    # 看「到底有没有真的走代理」
 ```
 
-> 还没装？见 [安装](#安装)（单文件、零依赖，三条命令搞定；旧版必须升级，原因见「新版 App 变了什么」）。
-
 ## 安装
 
 > 前置条件：macOS 13 或更高；本机已装 Clash / Clash Verge / v2rayN 等代理客户端；
