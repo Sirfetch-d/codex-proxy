@@ -9,66 +9,12 @@ codex-proxy persist   # 让后台 app-server 守护进程也走代理（手机�
 codex-proxy status    # 看「到底有没有真的走代理」
 ```
 
-> 还没装？见 [安装](#安装)（单文件、零依赖，三条命令搞定；旧版必须升级，原因见下一节）。
-
----
-
-## 新版 App 变了什么（重要）
-
-2026 年年中起，ChatGPT 桌面版从原生 App 换成了 **Electron（Chromium）内核**
-（`Contents/Resources/app.asar` + `Codex Framework.framework`，本机版本 `26.924.22138`）。
-这次重写让「只注入 `HTTP_PROXY` 环境变量」的老做法**彻底失效**，原因是有两条完全独立的网络路径：
-
-| 网络路径 | 谁在用 | 认什么代理 |
-| --- | --- | --- |
-| **Chromium 网络栈** | 界面与网页请求、`electron.net.fetch`、Statsig、`ws.chatgpt.com` 等 WebSocket | macOS 系统代理，或启动参数 `--proxy-server`。**在 macOS 上不读取 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 环境变量**（只有 Linux 版 Chromium 才读） |
-| **Rust `codex`** | `codex app-server`、模型请求、远程连接的**被控端** WebSocket、MCP | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 等环境变量，以及 `$CODEX_HOME/.env` |
-
-本机实测（macOS 27 + ChatGPT `26.924.22138`，代理端用日志代理观察真实连接）：
-
-| 启动方式 | 代理端收到的连接 |
-| --- | --- |
-| 只注入 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（老脚本做法） | **0** |
-| 加 `--args --proxy-server=http://127.0.0.1:7890` | `chatgpt.com:443`、`ws.chatgpt.com:443`、`developers.openai.com:443` … 全部出现 |
-
-因此本脚本现在**同时**处理两层：
-
-1. **Chromium 层**：`open -a ChatGPT.app --args --proxy-server=… --proxy-bypass-list=…`
-   → 界面、所有 REST 请求、以及 `ws.chatgpt.com` 这类 WebSocket 一起走代理。
-2. **Rust 层**：`--env HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY`（大小写各一份），
-   另外提供 `codex-proxy persist` 把代理写进 `~/.codex/.env`
-   → 后台 `app-server` 守护进程、终端里的 `codex` 在任何启动方式下都走代理。
-
-> 后台守护进程的坑：`codex app-server`（模型请求、远程连接被控端）由常驻 supervisor
-> `codex app-server daemon pid-update-loop` 派生，**ppid=1 脱离于 App**，重启 App 不会刷新它的环境变量。
-> 结果就是界面正常、模型请求却一直超时（`app-server.stderr.log` 里反复出现
-> `failed to refresh available models: request timed out`）、手机端显示「Mac 离线」。
-> 本脚本会在启动前清理这种「没有代理环境变量」的旧守护进程，并可用 `persist` 一劳永逸。
-
----
-
-## 对应修复的 issue
-
-| Issue | 现象 | 根因 | 修复 |
-| --- | --- | --- | --- |
-| [#3](../../issues/3) | 启动白屏 / 卡 logo，日志里 `sa_server_request_failed`、Statsig bootstrap 超时 | Chromium 层没走代理（环境变量对它无效） | `--proxy-server` |
-| [#4](../../issues/4) | macOS 27 卡在 logo 页，开 TUN 秒进 | 同上：请求直连超时 | `--proxy-server` |
-| [#2](../../issues/2) | 启动很慢、日志大量 timeout、`net::ERR_CONNECTION_TIMED_OUT` | 上半段：Chromium 层没走代理；下半段：`app-server` 守护进程没走代理 | `--proxy-server` + 环境变量 + 清理旧守护进程 |
-| [#5](../../issues/5) | 「搞的都无法正常用了」（白屏 / 转圈） | 同 #3 / #4 | 同上 |
-| [#1](../../issues/1) | 手机端一直显示「Mac 离线」，无法远程连接 | 远程连接的**被控端**长连接在 Rust `codex` 里，Chromium 的 `--proxy-server` 管不到 | `codex-proxy persist`（写 `~/.codex/.env`）；若仍不行见「排错」 |
-
-顺带修复的老毛病：端口写死 `7890`（Clash Verge 用 7897、v2rayN 用 10809 的用户会直接失败）。
-现在**默认自动读取 macOS 系统代理**（`scutil --proxy`），换客户端、换端口都不用改脚本。
-
----
-
-## 前置条件
-
-- macOS 13 或更高（`open --env` / `--args` 需要较新系统；更老的系统会自动降级为直接启动）
-- Clash / Clash Verge / v2rayN 等本地代理
-- 系统设置里已开启 HTTP/HTTPS 代理（推荐），或者用 `CODEX_PROXY` 指定
+> 还没装？见 [安装](#安装)（单文件、零依赖，三条命令搞定；旧版必须升级，原因见「新版 App 变了什么」）。
 
 ## 安装
+
+> 前置条件：macOS 13 或更高；本机已装 Clash / Clash Verge / v2rayN 等代理客户端；
+> 系统设置里已开启 HTTP/HTTPS 代理（也可以用 `CODEX_PROXY` 指定端口，见「自定义配置」）。
 
 脚本是**单文件、零依赖**（只用 macOS 自带的 `zsh` / `open` / `ps` / `scutil` / `curl`），
 不需要 `sudo`，不会写系统目录，也不会装 launchd 服务。两种装法任选：
@@ -142,6 +88,55 @@ codex-proxy stop          # 退出 App（含后台守护进程）
 codex-proxy persist off   # 撤销写进 ~/.codex/.env 的代理配置（若用过 persist）
 rm -f ~/bin/codex-proxy   # 删除脚本本体
 ```
+
+---
+
+## 新版 App 变了什么（重要）
+
+2026 年年中起，ChatGPT 桌面版从原生 App 换成了 **Electron（Chromium）内核**
+（`Contents/Resources/app.asar` + `Codex Framework.framework`，本机版本 `26.924.22138`）。
+这次重写让「只注入 `HTTP_PROXY` 环境变量」的老做法**彻底失效**，原因是有两条完全独立的网络路径：
+
+| 网络路径 | 谁在用 | 认什么代理 |
+| --- | --- | --- |
+| **Chromium 网络栈** | 界面与网页请求、`electron.net.fetch`、Statsig、`ws.chatgpt.com` 等 WebSocket | macOS 系统代理，或启动参数 `--proxy-server`。**在 macOS 上不读取 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 环境变量**（只有 Linux 版 Chromium 才读） |
+| **Rust `codex`** | `codex app-server`、模型请求、远程连接的**被控端** WebSocket、MCP | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 等环境变量，以及 `$CODEX_HOME/.env` |
+
+本机实测（macOS 27 + ChatGPT `26.924.22138`，代理端用日志代理观察真实连接）：
+
+| 启动方式 | 代理端收到的连接 |
+| --- | --- |
+| 只注入 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（老脚本做法） | **0** |
+| 加 `--args --proxy-server=http://127.0.0.1:7890` | `chatgpt.com:443`、`ws.chatgpt.com:443`、`developers.openai.com:443` … 全部出现 |
+
+因此本脚本现在**同时**处理两层：
+
+1. **Chromium 层**：`open -a ChatGPT.app --args --proxy-server=… --proxy-bypass-list=…`
+   → 界面、所有 REST 请求、以及 `ws.chatgpt.com` 这类 WebSocket 一起走代理。
+2. **Rust 层**：`--env HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY`（大小写各一份），
+   另外提供 `codex-proxy persist` 把代理写进 `~/.codex/.env`
+   → 后台 `app-server` 守护进程、终端里的 `codex` 在任何启动方式下都走代理。
+
+> 后台守护进程的坑：`codex app-server`（模型请求、远程连接被控端）由常驻 supervisor
+> `codex app-server daemon pid-update-loop` 派生，**ppid=1 脱离于 App**，重启 App 不会刷新它的环境变量。
+> 结果就是界面正常、模型请求却一直超时（`app-server.stderr.log` 里反复出现
+> `failed to refresh available models: request timed out`）、手机端显示「Mac 离线」。
+> 本脚本会在启动前清理这种「没有代理环境变量」的旧守护进程，并可用 `persist` 一劳永逸。
+
+---
+
+## 对应修复的 issue
+
+| Issue | 现象 | 根因 | 修复 |
+| --- | --- | --- | --- |
+| [#3](../../issues/3) | 启动白屏 / 卡 logo，日志里 `sa_server_request_failed`、Statsig bootstrap 超时 | Chromium 层没走代理（环境变量对它无效） | `--proxy-server` |
+| [#4](../../issues/4) | macOS 27 卡在 logo 页，开 TUN 秒进 | 同上：请求直连超时 | `--proxy-server` |
+| [#2](../../issues/2) | 启动很慢、日志大量 timeout、`net::ERR_CONNECTION_TIMED_OUT` | 上半段：Chromium 层没走代理；下半段：`app-server` 守护进程没走代理 | `--proxy-server` + 环境变量 + 清理旧守护进程 |
+| [#5](../../issues/5) | 「搞的都无法正常用了」（白屏 / 转圈） | 同 #3 / #4 | 同上 |
+| [#1](../../issues/1) | 手机端一直显示「Mac 离线」，无法远程连接 | 远程连接的**被控端**长连接在 Rust `codex` 里，Chromium 的 `--proxy-server` 管不到 | `codex-proxy persist`（写 `~/.codex/.env`）；若仍不行见「排错」 |
+
+顺带修复的老毛病：端口写死 `7890`（Clash Verge 用 7897、v2rayN 用 10809 的用户会直接失败）。
+现在**默认自动读取 macOS 系统代理**（`scutil --proxy`），换客户端、换端口都不用改脚本。
 
 ## 使用
 
