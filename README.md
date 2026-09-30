@@ -9,6 +9,8 @@ codex-proxy persist   # 让后台 app-server 守护进程也走代理（手机�
 codex-proxy status    # 看「到底有没有真的走代理」
 ```
 
+> 还没装？见 [安装](#安装)（单文件、零依赖，三条命令搞定；旧版必须升级，原因见下一节）。
+
 ---
 
 ## 新版 App 变了什么（重要）
@@ -68,11 +70,77 @@ codex-proxy status    # 看「到底有没有真的走代理」
 
 ## 安装
 
+脚本是**单文件、零依赖**（只用 macOS 自带的 `zsh` / `open` / `ps` / `scutil` / `curl`），
+不需要 `sudo`，不会写系统目录，也不会装 launchd 服务。两种装法任选：
+
+### 方式 A：软链接（推荐，之后 `git pull` 立即生效）
+
 ```bash
+git clone https://github.com/Sirfetch-d/codex-proxy.git ~/codex-proxy
+
 mkdir -p ~/bin
-cp codex-proxy ~/bin/codex-proxy
+chmod +x ~/codex-proxy/codex-proxy
+ln -sf ~/codex-proxy/codex-proxy ~/bin/codex-proxy      # 注意是绝对路径
+
+# 让 ~/bin 进 PATH（zsh，只需执行一次）
+grep -q 'HOME/bin' ~/.zshrc || echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+以后升级只要：`cd ~/codex-proxy && git pull`
+
+### 方式 B：复制（不想留仓库时）
+
+```bash
+git clone https://github.com/Sirfetch-d/codex-proxy.git /tmp/codex-proxy
+
+mkdir -p ~/bin
+cp /tmp/codex-proxy/codex-proxy ~/bin/codex-proxy       # 升级时重跑这一行
 chmod +x ~/bin/codex-proxy
-echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+
+grep -q 'HOME/bin' ~/.zshrc || echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+rm -rf /tmp/codex-proxy
+```
+
+### 确认命令真的生效
+
+```bash
+which codex-proxy       # 应输出 /Users/你的用户名/bin/codex-proxy
+codex-proxy --help      # 打印用法
+codex-proxy doctor      # 7 项自检，全绿即可
+codex-proxy start       # 启动 App（已在运行且配置正确则不会重启）
+```
+
+- `which codex-proxy` **没有输出** → `~/bin` 不在 PATH：
+
+  ```bash
+  echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+  ```
+
+  （用 bash 的写到 `~/.bash_profile`；只让当前终端生效：`export PATH="$HOME/bin:$PATH"`）
+- 提示 `permission denied` → 漏了 `chmod +x`。
+- 提示 `command not found` 但你确定装过 → 新开的终端才会读到新的 PATH，或执行 `hash -r`。
+
+### 从旧版升级（重要）
+
+旧版脚本只注入 `HTTP_PROXY` 环境变量，**对新版 Electron App 完全无效**，必须换成新版：
+
+```bash
+cd ~/codex-proxy && git pull     # 方式 A；方式 B 则重新执行一次 cp
+hash -r
+
+codex-proxy restart              # 先完全退出旧实例，再用 --proxy-server 启动
+codex-proxy persist              # 让后台 app-server / 远程连接也持久走代理
+codex-proxy doctor               # 自检
+```
+
+### 卸载
+
+```bash
+codex-proxy stop          # 退出 App（含后台守护进程）
+codex-proxy persist off   # 撤销写进 ~/.codex/.env 的代理配置（若用过 persist）
+rm -f ~/bin/codex-proxy   # 删除脚本本体
 ```
 
 ## 使用
